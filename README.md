@@ -1,2 +1,2 @@
 # ageage90
-HyperEuroBeat web based sampleing synth
+HyperEuroBeat web based loop synth
