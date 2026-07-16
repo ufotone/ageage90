@@ -1643,12 +1643,13 @@ function olaStretch(srcBuf, stretchRatio) {
 
   // グレインサイズ: 約46ms
   const grainSize = Math.floor(sr * 0.046);
-  // 入力ホップ
-  const hopIn  = Math.floor(grainSize / 4);
-  // 出力ホップ
-  const hopOut = Math.floor(hopIn * stretchRatio);
-  // 相関探索範囲: ±hopInの半分（広げすぎると重い、狭いと効果薄）
-  const searchRange = Math.floor(hopIn / 2);
+  // 合成ホップ: 固定 (75%オーバーラップ) ← 比率で変えると出力側の重なりが崩れて振幅変調が出る
+  const hopOut = Math.floor(grainSize / 4);
+  // 解析ホップ: 比率で可変
+  const hopIn  = hopOut / stretchRatio;
+  // 相関長 / 探索範囲
+  const corrLen     = Math.min(Math.floor(grainSize / 2), 1024);
+  const searchRange = Math.floor(hopOut / 2);
 
   const dstLen = Math.max(1, Math.floor(srcLen * stretchRatio));
   const dstBuf = audioCtx.createBuffer(nCh, dstLen, sr);
@@ -1659,65 +1660,68 @@ function olaStretch(srcBuf, stretchRatio) {
     win[i] = 0.5 * (1.0 - Math.cos(2.0 * Math.PI * i / (grainSize - 1)));
   }
 
-  // 相関計算: srcのoffset位置と前グレインrefとの類似度を返す
-  // 計算量を抑えるため先頭 corrLen サンプルだけ比較する
-  const corrLen = Math.floor(grainSize / 2);
-  function crossCorr(src, offset, ref) {
-    let acc = 0;
-    for (let i = 0; i < corrLen; i++) {
-      const si = offset + i;
-      acc += (si < srcLen ? src[si] : 0) * ref[i];
-    }
-    return acc;
-  }
-
   // ch=0 で最適オフセットを計算し、全chに適用（計算量削減）
   const ch0 = srcBuf.getChannelData(0);
 
-  // 前グレイン（相関の基準）: 最初はゼロ埋め
-  const prevGrain = new Float32Array(corrLen);
-
-  // 各グレインの最適入力オフセットを格納
-  const offsets = [];
-  {
-    let nominalIn = 0; // 相関なしの場合の理想入力位置
-    let outPos    = 0;
-    while (outPos < dstLen) {
-      // ±searchRange の範囲で最大相関位置を探す
-      let bestOffset = nominalIn;
-      let bestCorr   = -Infinity;
-      const lo = Math.max(0, nominalIn - searchRange);
-      const hi = Math.min(srcLen - 1, nominalIn + searchRange);
-      for (let candidate = lo; candidate <= hi; candidate++) {
-        const corr = crossCorr(ch0, candidate, prevGrain);
-        if (corr > bestCorr) { bestCorr = corr; bestOffset = candidate; }
+  // 各出力グレインの入力オフセットを決定
+  // 参照 ref = 「前グレインが出力上で hopOut 進んだ位置の波形」= 自然な続き
+  const nGrains = Math.ceil(dstLen / hopOut) + 1;
+  const offsets = new Int32Array(nGrains);
+  const ref = new Float32Array(corrLen);
+  let haveRef = false;
+  for (let g = 0; g < nGrains; g++) {
+    const nominal = Math.round(g * hopIn);
+    let best = Math.max(0, Math.min(srcLen - 1, nominal));
+    if (haveRef) {
+      let bestScore = -Infinity;
+      const lo = Math.max(0, nominal - searchRange);
+      const hi = Math.min(srcLen - 1, nominal + searchRange);
+      for (let cand = lo; cand <= hi; cand++) {
+        let dot = 0, energy = 0;
+        for (let i = 0; i < corrLen; i++) {
+          const si = cand + i;
+          const v = si < srcLen ? ch0[si] : 0;
+          dot    += v * ref[i];
+          energy += v * v;
+        }
+        // 正規化相互相関（高エネルギー区間へのバイアスを除く）
+        const score = dot / Math.sqrt(energy + 1e-9);
+        if (score > bestScore) { bestScore = score; best = cand; }
       }
-      offsets.push(bestOffset);
+    }
+    offsets[g] = best;
+    for (let i = 0; i < corrLen; i++) {
+      const si = best + hopOut + i;
+      ref[i] = si < srcLen ? ch0[si] : 0;
+    }
+    haveRef = true;
+  }
 
-      // 次ループのためにprevGrainを更新（窓なし生サンプル）
-      for (let i = 0; i < corrLen; i++) {
-        const si = bestOffset + i;
-        prevGrain[i] = si < srcLen ? ch0[si] : 0;
-      }
-
-      nominalIn += hopIn;
-      outPos    += hopOut;
+  // 窓の重なり総和 (WOLA正規化用)
+  const wsum = new Float32Array(dstLen);
+  for (let g = 0; g < nGrains; g++) {
+    const op = g * hopOut;
+    for (let i = 0; i < grainSize; i++) {
+      const o = op + i; if (o >= dstLen) break;
+      wsum[o] += win[i];
     }
   }
 
-  // 全chにオフセットを適用してOA
+  // 全chにオフセットを適用してOA → 窓総和で正規化
   for (let ch = 0; ch < nCh; ch++) {
     const src = srcBuf.getChannelData(ch);
     const dst = dstBuf.getChannelData(ch);
-    let outPos = 0;
-    for (let gi = 0; gi < offsets.length; gi++) {
-      const inPos = offsets[gi];
+    for (let g = 0; g < nGrains; g++) {
+      const op = g * hopOut, inPos = offsets[g];
       for (let i = 0; i < grainSize; i++) {
-        if (outPos + i >= dstLen) break;
+        const o = op + i; if (o >= dstLen) break;
         const si = inPos + i;
-        dst[outPos + i] += (si < srcLen ? src[si] : 0) * win[i];
+        dst[o] += (si < srcLen ? src[si] : 0) * win[i];
       }
-      outPos += hopOut;
+    }
+    for (let i = 0; i < dstLen; i++) {
+      const w = wsum[i];
+      if (w > 1e-3) dst[i] /= w;
     }
   }
   return dstBuf;
